@@ -91,6 +91,9 @@ pull_translations: ## pull translations from Transifex
 push_translations: ## push source translation files (.po) from Transifex
 	tx push -s
 
+test_translations: ## Test translation files
+	cd edx_proctoring && i18n_tool validate
+
 dummy_translations: ## generate dummy translation (.po) files
 	cd edx_proctoring && i18n_tool dummy
 

@@ -16,6 +16,7 @@ before_script:
 script:
 - make test-all
 - make test-js
+- make test_translations
 after_success:
 - coverage xml
 - bash <(curl -s https://codecov.io/bash) -cF python -f coverage.xml
