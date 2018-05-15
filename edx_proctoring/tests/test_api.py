@@ -10,7 +10,7 @@ from __future__ import absolute_import
 from datetime import datetime, timedelta
 import ddt
 from freezegun import freeze_time
-from mock import patch
+from mock import MagicMock, patch
 import pytz
 
 from edx_proctoring.api import (
@@ -43,6 +43,7 @@ from edx_proctoring.api import (
     _are_prerequirements_satisfied,
     create_exam_review_policy,
     get_review_policy_by_exam_id,
+    _get_review_policy_by_exam_id,
     update_review_policy,
     remove_review_policy,
 )
@@ -75,6 +76,7 @@ from .test_services import (
 from .utils import ProctoredExamTestCase
 
 
+@patch('django.core.urlresolvers.reverse', MagicMock)
 @ddt.ddt
 class ProctoredExamApiTests(ProctoredExamTestCase):
     """
@@ -193,6 +195,23 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
         self.assertEqual(exam_review_policy['proctored_exam']['id'], proctored_exam['id'])
         self.assertEqual(exam_review_policy['set_by_user']['id'], self.user_id)
         self.assertEqual(exam_review_policy['review_policy'], u'allow use of paper')
+
+    def test_get_exam_review_policy(self):
+        """
+        Test that creates a new exam policy and tests
+        that the policy can be properly retrieved
+        """
+        proctored_exam = get_exam_by_id(self.proctored_exam_id)
+        create_exam_review_policy(
+            exam_id=proctored_exam['id'],
+            set_by_user_id=self.user_id,
+            review_policy=u'allow use of paper'
+        )
+
+        # now get the exam review policy for the proctored exam
+        exam_review_policy_string = _get_review_policy_by_exam_id(proctored_exam['id'])
+
+        self.assertEqual(exam_review_policy_string, u'allow use of paper')
 
     def test_update_exam_review_policy(self):
         """
@@ -943,17 +962,19 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
                 to_status
             )
 
-    def test_alias_timed_out(self):
+    def test_time_out_as_submitted(self):
         """
         Verified that timed_out will automatically state transition
         to submitted
         """
 
         exam_attempt = self._create_started_exam_attempt()
+        random_timestamp = datetime.now(pytz.UTC) - timedelta(hours=4)
         update_attempt_status(
             exam_attempt.proctored_exam_id,
             self.user.id,
-            ProctoredExamStudentAttemptStatus.timed_out
+            ProctoredExamStudentAttemptStatus.timed_out,
+            timeout_timestamp=random_timestamp
         )
 
         exam_attempt = get_exam_attempt_by_id(exam_attempt.id)
@@ -961,6 +982,37 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
         self.assertEqual(
             exam_attempt['status'],
             ProctoredExamStudentAttemptStatus.submitted
+        )
+
+        self.assertEqual(
+            exam_attempt['completed_at'],
+            random_timestamp
+        )
+
+    @patch.dict('django.conf.settings.PROCTORING_SETTINGS', {'ALLOW_TIMED_OUT_STATE': True})
+    def test_timeout_not_submitted(self):
+        """
+        Test that when the setting is disabled, the status remains timed_out
+        """
+        exam_attempt = self._create_started_exam_attempt()
+        random_timestamp = datetime.now(pytz.UTC) - timedelta(hours=4)
+        update_attempt_status(
+            exam_attempt.proctored_exam_id,
+            self.user.id,
+            ProctoredExamStudentAttemptStatus.timed_out,
+            timeout_timestamp=random_timestamp
+        )
+
+        exam_attempt = get_exam_attempt_by_id(exam_attempt.id)
+
+        self.assertEqual(
+            exam_attempt['status'],
+            ProctoredExamStudentAttemptStatus.timed_out
+        )
+
+        self.assertNotEqual(
+            exam_attempt['completed_at'],
+            random_timestamp
         )
 
     def test_update_unexisting_attempt(self):
