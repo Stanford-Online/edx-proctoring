@@ -224,16 +224,6 @@ class ProctoredExamStudentAttemptStatus(object):
         ]
 
     @classmethod
-    def needs_status_change_email(cls, to_status):
-        """
-        We need to send out emails for rejected, verified and submitted statuses.
-        """
-
-        return to_status in [
-            cls.rejected, cls.submitted, cls.verified
-        ]
-
-    @classmethod
     def get_status_alias(cls, status):
         """
         Returns status alias used in email
@@ -314,7 +304,7 @@ class ProctoredExamReviewPolicyHistory(TimeStampedModel):
         db_table = 'proctoring_proctoredexamreviewpolicyhistory'
         verbose_name = 'proctored exam review policy history'
 
-    def delete(self, *args, **kwargs):
+    def delete(self, *args, **kwargs):  # pylint: disable=arguments-differ
         """
         Don't allow deletions!
         """
@@ -757,7 +747,7 @@ class ProctoredExamStudentAllowance(TimeStampedModel):
         user_id = None
 
         # see if key is a tuple, if it is, then the first element is the key
-        if isinstance(key, tuple) and len(key) > 0:
+        if isinstance(key, tuple) and len(key) > 0:  # pylint: disable=len-as-condition
             key = key[0]
 
         if not cls.is_allowance_value_valid(key, value):

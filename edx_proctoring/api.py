@@ -13,7 +13,8 @@ import pytz
 
 from django.utils.translation import ugettext as _, ugettext_noop
 from django.conf import settings
-from django.template import Context, loader
+from django.contrib.auth.models import User
+from django.template import loader
 from django.core.urlresolvers import reverse, NoReverseMatch
 from django.core.mail.message import EmailMessage
 
@@ -54,6 +55,8 @@ from edx_proctoring.runtime import get_runtime_service
 log = logging.getLogger(__name__)
 
 SHOW_EXPIRY_MESSAGE_DURATION = 1 * 60  # duration within which expiry message is shown for a timed-out exam
+
+APPROVED_STATUS = 'approved'
 
 
 def create_exam(course_id, content_id, exam_name, time_limit_mins, due_date=None,
@@ -200,6 +203,19 @@ def get_review_policy_by_exam_id(exam_id):
         raise ProctoredExamReviewPolicyNotFoundException
 
     return ProctoredExamReviewPolicySerializer(exam_review_policy).data
+
+
+def _get_review_policy_by_exam_id(exam_id):
+    """
+    Looks up exam by the primary key. Returns None if not found
+
+    Returns review_policy field of the Django ORM object
+    """
+    try:
+        exam_review_policy = get_review_policy_by_exam_id(exam_id)
+        return ProctoredExamReviewPolicySerializer(exam_review_policy).data['review_policy']
+    except ProctoredExamReviewPolicyNotFoundException:
+        return None
 
 
 def update_exam(exam_id, exam_name=None, time_limit_mins=None, due_date=constants.MINIMUM_TIME,
@@ -391,7 +407,8 @@ def _check_for_attempt_timeout(attempt):
             update_attempt_status(
                 attempt['proctored_exam']['id'],
                 attempt['user']['id'],
-                ProctoredExamStudentAttemptStatus.timed_out
+                ProctoredExamStudentAttemptStatus.timed_out,
+                timeout_timestamp=expires_at
             )
             attempt = get_exam_attempt_by_id(attempt['id'])
 
@@ -715,7 +732,8 @@ def mark_exam_attempt_as_ready(exam_id, user_id):
     return update_attempt_status(exam_id, user_id, ProctoredExamStudentAttemptStatus.ready_to_start)
 
 
-def update_attempt_status(exam_id, user_id, to_status, raise_if_not_found=True, cascade_effects=True):
+def update_attempt_status(exam_id, user_id, to_status,
+                          raise_if_not_found=True, cascade_effects=True, timeout_timestamp=None):
     """
     Internal helper to handle state transitions of attempt status
     """
@@ -730,11 +748,11 @@ def update_attempt_status(exam_id, user_id, to_status, raise_if_not_found=True, 
 
     # In some configuration we may treat timeouts the same
     # as the user saying he/she wises to submit the exam
-    alias_timeout = (
+    treat_timeout_as_submitted = (
         to_status == ProctoredExamStudentAttemptStatus.timed_out and
         not settings.PROCTORING_SETTINGS.get('ALLOW_TIMED_OUT_STATE', False)
     )
-    if alias_timeout:
+    if treat_timeout_as_submitted:
         to_status = ProctoredExamStudentAttemptStatus.submitted
 
     exam_attempt_obj = ProctoredExamStudentAttempt.objects.get_exam_attempt(exam_id, user_id)
@@ -792,6 +810,8 @@ def update_attempt_status(exam_id, user_id, to_status, raise_if_not_found=True, 
     )
     if add_start_time:
         exam_attempt_obj.started_at = datetime.now(pytz.UTC)
+    elif treat_timeout_as_submitted:
+        exam_attempt_obj.completed_at = timeout_timestamp
     elif to_status == ProctoredExamStudentAttemptStatus.submitted:
         # likewise, when we transition to submitted mark
         # when the exam has been completed
@@ -881,38 +901,31 @@ def update_attempt_status(exam_id, user_id, to_status, raise_if_not_found=True, 
                 cascade_effects=False
             )
 
-    # email will be send when the exam is proctored and not practice exam
-    # and the status is verified, submitted or rejected
-    should_send_status_email = (
-        exam_attempt_obj.taking_as_proctored and
-        not exam_attempt_obj.is_sample_attempt and
-        ProctoredExamStudentAttemptStatus.needs_status_change_email(exam_attempt_obj.status)
+    # call service to get course name.
+    credit_service = get_runtime_service('credit')
+    credit_state = credit_service.get_credit_state(
+        exam_attempt_obj.user_id,
+        exam_attempt_obj.proctored_exam.course_id,
+        return_course_info=True
     )
-    if should_send_status_email:
-        # trigger credit workflow, as needed
-        credit_service = get_runtime_service('credit')
 
-        # call service to get course name.
-        credit_state = credit_service.get_credit_state(
+    default_name = _('your course')
+    if credit_state:
+        course_name = credit_state.get('course_name', default_name)
+    else:
+        course_name = default_name
+        log.info(
+            "Could not find credit_state for user id %r in the course %r.",
             exam_attempt_obj.user_id,
-            exam_attempt_obj.proctored_exam.course_id,
-            return_course_info=True
+            exam_attempt_obj.proctored_exam.course_id
         )
-
-        default_name = _('your course')
-        if credit_state:
-            course_name = credit_state.get('course_name', default_name)
-        else:
-            course_name = default_name
-            log.info(
-                "Could not find credit_state for user id %r in the course %r.",
-                exam_attempt_obj.user_id,
-                exam_attempt_obj.proctored_exam.course_id
-            )
-        send_proctoring_attempt_status_email(
-            exam_attempt_obj,
-            course_name
-        )
+    email = create_proctoring_attempt_status_email(
+        user_id,
+        exam_attempt_obj,
+        course_name
+    )
+    if email:
+        email.send()
 
     # emit an anlytics event based on the state transition
     # we re-read this from the database in case fields got updated
@@ -925,20 +938,46 @@ def update_attempt_status(exam_id, user_id, to_status, raise_if_not_found=True, 
     return attempt['id']
 
 
-def send_proctoring_attempt_status_email(exam_attempt_obj, course_name):
+def create_proctoring_attempt_status_email(user_id, exam_attempt_obj, course_name):
     """
-    Sends an email about change in proctoring attempt status.
+    Creates an email about change in proctoring attempt status.
     """
+    # Don't send an email unless this is a non-practice proctored exam
+    if not exam_attempt_obj.taking_as_proctored or exam_attempt_obj.is_sample_attempt:
+        return None
 
+    user = User.objects.get(id=user_id)
     course_info_url = ''
-    email_template = loader.get_template('emails/proctoring_attempt_status_email.html')
+    email_subject = (
+        _('Proctoring Results For {course_name} {exam_name}').format(
+            course_name=course_name,
+            exam_name=exam_attempt_obj.proctored_exam.exam_name
+        )
+    )
+    status = exam_attempt_obj.status
+    if status == ProctoredExamStudentAttemptStatus.submitted:
+        email_template_path = 'emails/proctoring_attempt_submitted_email.html'
+        email_subject = (
+            _('Proctoring Review In Progress For {course_name} {exam_name}').format(
+                course_name=course_name,
+                exam_name=exam_attempt_obj.proctored_exam.exam_name
+            )
+        )
+    elif status == ProctoredExamStudentAttemptStatus.verified:
+        email_template_path = 'emails/proctoring_attempt_satisfactory_email.html'
+    elif status == ProctoredExamStudentAttemptStatus.rejected:
+        email_template_path = 'emails/proctoring_attempt_unsatisfactory_email.html'
+    else:
+        # Don't send an email for any other attempt status codes
+        return None
+    email_template = loader.get_template(email_template_path)
     try:
         course_info_url = reverse(
             'courseware.views.views.course_info',
             args=[exam_attempt_obj.proctored_exam.course_id]
         )
     except NoReverseMatch:
-        log.exception("Can't find Course Info url for course %s", exam_attempt_obj.proctored_exam.course_id)
+        log.exception("Can't find course info url for course %s", exam_attempt_obj.proctored_exam.course_id)
 
     scheme = 'https' if getattr(settings, 'HTTPS', 'on') == 'on' else 'http'
     course_url = '{scheme}://{site_name}{course_info_url}'.format(
@@ -946,33 +985,32 @@ def send_proctoring_attempt_status_email(exam_attempt_obj, course_name):
         site_name=constants.SITE_NAME,
         course_info_url=course_info_url
     )
-
-    body = email_template.render(
-        Context({
-            'course_url': course_url,
-            'course_name': course_name,
-            'exam_name': exam_attempt_obj.proctored_exam.exam_name,
-            'status': ProctoredExamStudentAttemptStatus.get_status_alias(exam_attempt_obj.status),
-            'platform': constants.PLATFORM_NAME,
-            'contact_email': constants.CONTACT_EMAIL,
-        })
+    exam_name = exam_attempt_obj.proctored_exam.exam_name
+    support_email_subject = _('Proctored exam {exam_name} in {course_name} for user {username}').format(
+        exam_name=exam_name,
+        course_name=course_name,
+        username=user.username,
     )
 
-    subject = (
-        _('Proctoring Session Results Update for {course_name} {exam_name}').format(
-            course_name=course_name,
-            exam_name=exam_attempt_obj.proctored_exam.exam_name
-        )
-    )
+    body = email_template.render({
+        'username': user.username,
+        'course_url': course_url,
+        'course_name': course_name,
+        'exam_name': exam_name,
+        'status': status,
+        'platform': constants.PLATFORM_NAME,
+        'contact_email': constants.CONTACT_EMAIL,
+        'support_email_subject': support_email_subject,
+    })
 
     email = EmailMessage(
         body=body,
         from_email=constants.FROM_EMAIL,
         to=[exam_attempt_obj.user.email],
-        subject=subject
+        subject=email_subject,
     )
-    email.content_subtype = "html"
-    email.send()
+    email.content_subtype = 'html'
+    return email
 
 
 def remove_exam_attempt(attempt_id, requesting_user):
@@ -1486,7 +1524,6 @@ def _get_timed_exam_view(exam, context, exam_id, user_id, course_id):
 
     if student_view_template:
         template = loader.get_template(student_view_template)
-        django_context = Context(context)
 
         allowed_time_limit_mins = attempt['allowed_time_limit_mins'] if attempt else None
 
@@ -1520,7 +1557,7 @@ def _get_timed_exam_view(exam, context, exam_id, user_id, course_id):
         except NoReverseMatch:
             log.exception("Can't find progress url for course %s", course_id)
 
-        django_context.update({
+        context.update({
             'total_time': total_time,
             'hide_extra_time_footer': hide_extra_time_footer,
             'will_be_revealed': has_due_date and not exam['hide_after_due'],
@@ -1535,7 +1572,7 @@ def _get_timed_exam_view(exam, context, exam_id, user_id, course_id):
                 args=[attempt['id']]
             ) if attempt else '',
         })
-        return template.render(django_context)
+        return template.render(context)
 
 
 def _calculate_allowed_mins(due_datetime, allowed_mins):
@@ -1599,6 +1636,7 @@ def _get_proctored_exam_context(exam, attempt, course_id, is_practice_exam=False
         ) if attempt else '',
         'link_urls': settings.PROCTORING_SETTINGS.get('LINK_URLS', {}),
         'tech_support_email': settings.TECH_SUPPORT_EMAIL,
+        'exam_review_policy': _get_review_policy_by_exam_id(exam['id']),
     }
 
 
@@ -1636,9 +1674,8 @@ def _get_practice_exam_view(exam, context, exam_id, user_id, course_id):
 
     if student_view_template:
         template = loader.get_template(student_view_template)
-        django_context = Context(context)
-        django_context.update(_get_proctored_exam_context(exam, attempt, course_id, is_practice_exam=True))
-        return template.render(django_context)
+        context.update(_get_proctored_exam_context(exam, attempt, course_id, is_practice_exam=True))
+        return template.render(context)
 
 
 def _get_proctored_exam_view(exam, context, exam_id, user_id, course_id):
@@ -1737,7 +1774,7 @@ def _get_proctored_exam_view(exam, context, exam_id, user_id, course_id):
         return None
     elif attempt_status in [ProctoredExamStudentAttemptStatus.created,
                             ProctoredExamStudentAttemptStatus.download_software_clicked]:
-        if context.get('verification_status') is not 'approved':
+        if context.get('verification_status') is not APPROVED_STATUS:
             # if the user has not id verified yet, show them the page that requires them to do so
             student_view_template = 'proctored_exam/id_verification.html'
         else:
@@ -1780,9 +1817,8 @@ def _get_proctored_exam_view(exam, context, exam_id, user_id, course_id):
 
     if student_view_template:
         template = loader.get_template(student_view_template)
-        django_context = Context(context)
-        django_context.update(_get_proctored_exam_context(exam, attempt, course_id))
-        return template.render(django_context)
+        context.update(_get_proctored_exam_context(exam, attempt, course_id))
+        return template.render(context)
 
 
 def get_student_view(user_id, course_id, content_id,
@@ -1854,5 +1890,4 @@ def get_student_view(user_id, course_id, content_id,
 
     if sub_view_func:
         return sub_view_func(exam, context, exam_id, user_id, course_id)
-    else:
-        return None
+    return None
